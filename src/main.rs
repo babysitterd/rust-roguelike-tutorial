@@ -72,6 +72,56 @@ impl Rectangle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DeathCallback {
+    Player,
+    Monster,
+}
+
+impl DeathCallback {
+    fn callback(self, object: &mut Object) {
+        use DeathCallback::*;
+        let callback: fn(&mut Object) = match self {
+            Player => player_death,
+            Monster => monster_death,
+        };
+        callback(object);
+    }
+}
+
+fn player_death(player: &mut Object) {
+    println!("You died!");
+
+    player.glyph = '%';
+    player.color = DARK_RED;
+}
+
+fn monster_death(monster: &mut Object) {
+    println!("{} is dead!", monster.name);
+
+    monster.glyph = '%';
+    monster.color = DARK_RED;
+    monster.blocks = false;
+    monster.fighter = None;
+    monster.ai = None;
+    monster.name = format!("remains of {}", monster.name);
+}
+
+// combat-related properties and methods (monster, player, NPC).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Fighter {
+    max_hp: i32,
+    hp: i32,
+    defense: i32,
+    power: i32,
+    on_death: DeathCallback,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Ai {
+    Basic,
+}
+
 /// This is a generic object: the player, a monster, an item, the stairs...
 /// It's always represented by a character on screen.
 #[derive(Clone, Debug)]
@@ -83,6 +133,8 @@ struct Object {
     name: String,
     blocks: bool,
     alive: bool,
+    fighter: Option<Fighter>,
+    ai: Option<Ai>,
 }
 
 impl Object {
@@ -95,6 +147,42 @@ impl Object {
             name: name.into(),
             blocks: blocks,
             alive: false,
+            fighter: None,
+            ai: None,
+        }
+    }
+
+    pub fn take_damage(&mut self, damage: i32) {
+        if let Some(fighter) = self.fighter.as_mut() {
+            if damage > 0 {
+                fighter.hp = cmp::max(fighter.hp - damage, 0);
+            }
+            // should not compile due to double-borrowing?
+            if self.alive && fighter.hp == 0 {
+                self.alive = false;
+                fighter.on_death.callback(self);
+            }
+        }
+        //if let Some(fighter) = self.fighter {
+        //    if self.alive && fighter.hp == 0 {
+        //        self.alive = false;
+        //        fighter.on_death.callback(self);
+        //    }
+        //}
+    }
+
+    pub fn attack(&self, other: &mut Object) {
+        if let (Some(off), Some(def)) = (self.fighter, other.fighter) {
+            let damage = off.power - def.defense;
+            if damage > 0 {
+                println!(
+                    "{} attacks {} for {} hit points.",
+                    self.name, other.name, damage
+                );
+                other.take_damage(damage);
+            } else {
+                println!("{} attacks {} but it has no effect!", self.name, other.name);
+            }
         }
     }
 
@@ -111,6 +199,12 @@ impl Object {
     pub fn set_pos(&mut self, x: i32, y: i32) {
         self.x = x;
         self.y = y;
+    }
+
+    pub fn distance_to(&self, other: &Object) -> f32 {
+        let dx = other.x - self.x;
+        let dy = other.y - self.y;
+        ((dx * dx + dy * dy) as f32).sqrt()
     }
 }
 
@@ -132,16 +226,48 @@ fn player_move_or_attack(dx: i32, dy: i32, map: &Map, objects: &mut [Object]) {
     let pos = objects[PLAYER].pos();
     let new_pos = (pos.0 + dx, pos.1 + dy);
 
-    let target_id = objects.iter().position(|enemy| enemy.pos() == new_pos);
+    let target_id = objects
+        .iter()
+        .position(|enemy| enemy.fighter.is_some() && enemy.pos() == new_pos);
 
     if let Some(id) = target_id {
-        println!(
-            "The {} laughs at your puny efforts to attack him!",
-            objects[id].name
-        );
+        let (player, monster) = mut_two(PLAYER, id, objects);
+        player.attack(monster);
     } else {
         move_by(PLAYER, dx, dy, map, objects);
     }
+}
+
+/// Mutably borrow two *separate* elements from the slice
+fn mut_two<T>(first_id: usize, second_id: usize, items: &mut [T]) -> (&mut T, &mut T) {
+    assert!(first_id < second_id);
+    let (first_slice, second_slice) = items.split_at_mut(second_id);
+    (&mut first_slice[first_id], &mut second_slice[0])
+}
+
+fn ai_take_turn(monster_id: usize, tcod: &Tcod, map: &Map, objects: &mut [Object]) {
+    let (monster_x, monster_y) = objects[monster_id].pos();
+    if tcod.fov.is_in_fov(monster_x, monster_y) {
+        if objects[monster_id].distance_to(&objects[PLAYER]) >= 2.0 {
+            let (player_x, player_y) = objects[PLAYER].pos();
+            move_towards(monster_id, player_x, player_y, map, objects);
+        } else if objects[PLAYER].fighter.map_or(false, |f| f.hp >= 0) {
+            let (player, monster) = mut_two(PLAYER, monster_id, objects);
+            monster.attack(player);
+        }
+    }
+}
+
+fn move_towards(id: usize, target_x: i32, target_y: i32, map: &Map, objects: &mut [Object]) {
+    let dx = target_x - objects[id].x;
+    let dy = target_y - objects[id].y;
+    let distance = ((dx * dx + dy * dy) as f32).sqrt();
+
+    // normalize it to length 1 (preserving direction), then round it and
+    // convert to integer so the movement is restricted to the map grid
+    let dx = (dx as f32 / distance).round() as i32;
+    let dy = (dy as f32 / distance).round() as i32;
+    move_by(id, dx, dy, map, objects);
 }
 
 /// A tile of the map and its properties
@@ -268,6 +394,34 @@ fn is_out_of_bounds(x: i32, y: i32) -> bool {
     x < 0 || x >= MAP_WIDTH || y < 0 || y >= MAP_HEIGHT
 }
 
+fn create_orc(x: i32, y: i32) -> Object {
+    let mut orc = Object::new(x, y, 'o', DESATURATED_GREEN, "orc", true);
+    orc.alive = true;
+    orc.fighter = Some(Fighter {
+        max_hp: 10,
+        hp: 10,
+        defense: 0,
+        power: 3,
+        on_death: DeathCallback::Monster,
+    });
+    orc.ai = Some(Ai::Basic);
+    orc
+}
+
+fn create_troll(x: i32, y: i32) -> Object {
+    let mut troll = Object::new(x, y, 'T', DARKER_GREEN, "troll", true);
+    troll.alive = true;
+    troll.fighter = Some(Fighter {
+        max_hp: 16,
+        hp: 16,
+        defense: 1,
+        power: 4,
+        on_death: DeathCallback::Monster,
+    });
+    troll.ai = Some(Ai::Basic);
+    troll
+}
+
 fn fill_with_monsters(room: &Rectangle, map: &Map, objects: &mut Vec<Object>) {
     let monster_count = rand::thread_rng().gen_range(0, MAX_ROOM_MONSTERS + 1);
 
@@ -280,14 +434,13 @@ fn fill_with_monsters(room: &Rectangle, map: &Map, objects: &mut Vec<Object>) {
             continue;
         }
 
-        let mut monster = if rand::random::<f32>() < 0.8 {
+        let monster = if rand::random::<f32>() < 0.8 {
             // 80% chance of getting an orc
-            Object::new(x, y, 'o', DESATURATED_GREEN, "orc", true)
+            create_orc(x, y)
         } else {
-            Object::new(x, y, 'T', DARKER_GREEN, "troll", true)
+            create_troll(x, y)
         };
 
-        monster.alive = true;
         objects.push(monster);
     }
 }
@@ -327,8 +480,14 @@ fn render_all(tcod: &mut Tcod, map: &Map, objects: &[Object]) {
         }
     }
 
+    let mut to_draw: Vec<_> = objects
+        .iter()
+        .filter(|o| tcod.fov.is_in_fov(o.x, o.y))
+        .collect();
+    to_draw.sort_by(|lhs, rhs| lhs.blocks.cmp(&rhs.blocks));
+
     // render objects
-    for obj in objects {
+    for obj in to_draw {
         if tcod.fov.is_in_fov(obj.x, obj.y) {
             obj.draw(&mut tcod.con);
         }
@@ -344,6 +503,18 @@ fn render_all(tcod: &mut Tcod, map: &Map, objects: &[Object]) {
         1.0,
         1.0,
     );
+
+    // render hud
+    tcod.root.set_default_foreground(WHITE);
+    if let Some(fighter) = objects[PLAYER].fighter {
+        tcod.root.print_ex(
+            1,
+            SCREEN_HEIGHT - 2,
+            BackgroundFlag::None,
+            TextAlignment::Left,
+            format!("HP: {}/{}", fighter.hp, fighter.max_hp),
+        )
+    }
 }
 
 struct Tcod {
@@ -417,6 +588,13 @@ fn main() {
     // game objects
     let mut player = Object::new(0, 0, '@', WHITE, "player", true);
     player.alive = true;
+    player.fighter = Some(Fighter {
+        max_hp: 30,
+        hp: 30,
+        defense: 2,
+        power: 5,
+        on_death: DeathCallback::Player,
+    });
     let mut objects = vec![player];
 
     // game map
@@ -450,8 +628,10 @@ fn main() {
         }
         if action != PlayerAction::DidntTakeTurn && objects[PLAYER].alive {
             // only if object is not player
-            for i in 1..objects.len() {
-                println!("The {} growls!", objects[i].name);
+            for id in 1..objects.len() {
+                if objects[id].ai.is_some() {
+                    ai_take_turn(id, &tcod, &game.map, &mut objects)
+                }
             }
         }
     }
