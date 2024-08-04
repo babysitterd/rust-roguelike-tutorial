@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tcod = "0.15"
+tcod = { git = "https://github.com/tomassedovic/tcod-rs.git", rev = "d4ad074"}
 rand = "0.3.9"
