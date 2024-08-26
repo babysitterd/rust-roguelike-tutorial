@@ -1,3 +1,4 @@
+use rand::distributions::{IndependentSample, Weighted, WeightedChoice};
 use rand::Rng;
 use std::cmp;
 use std::error::Error;
@@ -40,18 +41,17 @@ const MSG_HEIGHT: usize = PANEL_HEIGHT as usize - 1;
 const ROOM_MAX_SIZE: i32 = 10;
 const ROOM_MIN_SIZE: i32 = 6;
 const MAX_ROOMS: i32 = 30;
-const MAX_ROOM_ITEMS: i32 = 2;
 
 const FOV_ALGO: FovAlgorithm = FovAlgorithm::Basic; // default FOV algorithm
 const FOV_LIGHT_WALLS: bool = true; // light walls or not
 const TORCH_RADIUS: i32 = 10;
-const HEAL_AMOUNT: i32 = 4;
+const HEAL_AMOUNT: i32 = 40;
 const LIGHTNING_DAMAGE: i32 = 40;
 const LIGHTNING_RANGE: i32 = 5;
 const CONFUSE_RANGE: i32 = 8;
 const CONFUSE_NUM_TURNS: i32 = 10;
 const FIREBALL_RADIUS: i32 = 3;
-const FIREBALL_DAMAGE: i32 = 12;
+const FIREBALL_DAMAGE: i32 = 25;
 
 // experience and level-ups
 const LEVEL_UP_BASE: i32 = 200;
@@ -73,8 +73,6 @@ const COLOR_LIGHT_GROUND: Color = Color {
     g: 180,
     b: 50,
 };
-
-const MAX_ROOM_MONSTERS: i32 = 3;
 
 // player will always be the first object
 const PLAYER: usize = 0;
@@ -150,10 +148,10 @@ fn monster_death(monster: &mut Object, game: &mut Game) {
 // combat-related properties and methods (monster, player, NPC).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Fighter {
-    max_hp: i32,
+    base_max_hp: i32,
     hp: i32,
-    defense: i32,
-    power: i32,
+    base_defense: i32,
+    base_power: i32,
     xp: i32,
     on_death: DeathCallback,
 }
@@ -201,6 +199,7 @@ struct Object {
     fighter: Option<Fighter>,
     ai: Option<Ai>,
     item: Option<Item>,
+    equipment: Option<Equipment>,
     always_visible: bool,
 }
 
@@ -218,6 +217,7 @@ impl Object {
             fighter: None,
             ai: None,
             item: None,
+            equipment: None,
             always_visible: false,
         }
     }
@@ -241,31 +241,120 @@ impl Object {
     }
 
     pub fn attack(&mut self, other: &mut Object, game: &mut Game) {
-        if let (Some(off), Some(def)) = (self.fighter, other.fighter) {
-            let damage = off.power - def.defense;
-            if damage > 0 {
-                game.messages.add(
-                    format!(
-                        "{} attacks {} for {} hit points.",
-                        self.name, other.name, damage
-                    ),
-                    WHITE,
-                );
-                if let Some(xp) = other.take_damage(damage, game) {
-                    self.fighter.as_mut().unwrap().xp += xp;
-                }
-            } else {
-                game.messages.add(
-                    format!("{} attacks {} but it has no effect!", self.name, other.name),
-                    WHITE,
-                );
+        let damage = self.power(game) - other.defense(game);
+        if damage > 0 {
+            game.messages.add(
+                format!(
+                    "{} attacks {} for {} hit points.",
+                    self.name, other.name, damage
+                ),
+                WHITE,
+            );
+            if let Some(xp) = other.take_damage(damage, game) {
+                self.fighter.as_mut().unwrap().xp += xp;
             }
+        } else {
+            game.messages.add(
+                format!("{} attacks {} but it has no effect!", self.name, other.name),
+                WHITE,
+            );
         }
     }
 
-    pub fn heal(&mut self, amount: i32) {
+    pub fn heal(&mut self, amount: i32, game: &Game) {
+        let max_hp = self.max_hp(game);
         if let Some(ref mut fighter) = self.fighter {
-            fighter.hp = cmp::min(fighter.hp + amount, fighter.max_hp);
+            fighter.hp = cmp::min(fighter.hp + amount, max_hp);
+        }
+    }
+
+    pub fn max_hp(&self, game: &Game) -> i32 {
+        let base_max_hp = self.fighter.map_or(0, |f| f.base_max_hp);
+        let bonus: i32 = self
+            .get_all_equipped(game)
+            .iter()
+            .map(|e| e.max_hp_bonus)
+            .sum();
+        base_max_hp + bonus
+    }
+
+    pub fn power(&self, game: &Game) -> i32 {
+        let base_power = self.fighter.map_or(0, |f| f.base_power);
+        let bonus: i32 = self
+            .get_all_equipped(game)
+            .iter()
+            .map(|e| e.power_bonus)
+            .sum();
+        base_power + bonus
+    }
+
+    pub fn defense(&self, game: &Game) -> i32 {
+        let base_defense = self.fighter.map_or(0, |f| f.base_defense);
+        let bonus: i32 = self
+            .get_all_equipped(game)
+            .iter()
+            .map(|e| e.defense_bonus)
+            .sum();
+        base_defense + bonus
+    }
+
+    pub fn get_all_equipped(&self, game: &Game) -> Vec<Equipment> {
+        if self.name == "player" {
+            game.inventory
+                .iter()
+                .filter(|item| item.equipment.map_or(false, |e| e.equipped))
+                .map(|item| item.equipment.unwrap())
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    pub fn equip(&mut self, messages: &mut Messages) {
+        if self.item.is_none() {
+            messages.add(
+                format!("Can't equip {:?} because it's not an Item.", self),
+                RED,
+            );
+            return;
+        }
+        if let Some(ref mut equipment) = self.equipment {
+            if !equipment.equipped {
+                equipment.equipped = true;
+                messages.add(
+                    format!("Equipped {} on {}.", self.name, equipment.slot),
+                    LIGHT_GREEN,
+                );
+            }
+        } else {
+            messages.add(
+                format!("Can't equip {:?} because it's not an Equipment.", self),
+                RED,
+            );
+        }
+    }
+
+    pub fn dequip(&mut self, messages: &mut Messages) {
+        if self.item.is_none() {
+            messages.add(
+                format!("Can't dequip {:?} because it's not an Item.", self),
+                RED,
+            );
+            return;
+        }
+        if let Some(ref mut equipment) = self.equipment {
+            if equipment.equipped {
+                equipment.equipped = false;
+                messages.add(
+                    format!("Dequipped {} on {}.", self.name, equipment.slot),
+                    LIGHT_GREEN,
+                );
+            }
+        } else {
+            messages.add(
+                format!("Can't dequip {:?} because it's not an Equipment.", self),
+                RED,
+            );
         }
     }
 
@@ -406,6 +495,32 @@ fn move_towards(id: usize, target_x: i32, target_y: i32, game: &mut Game, object
     move_by(id, dx, dy, game, objects);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct Equipment {
+    slot: Slot,
+    equipped: bool,
+    max_hp_bonus: i32,
+    defense_bonus: i32,
+    power_bonus: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+enum Slot {
+    LeftHand,
+    RightHand,
+    Head,
+}
+
+impl std::fmt::Display for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Slot::Head => write!(f, "head"),
+            Slot::LeftHand => write!(f, "left hand"),
+            Slot::RightHand => write!(f, "right hand"),
+        }
+    }
+}
+
 /// A tile of the map and its properties
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct Tile {
@@ -434,6 +549,19 @@ impl Tile {
 
 type Map = Vec<Vec<Tile>>;
 
+struct Transition {
+    level: u32,
+    value: u32,
+}
+
+fn from_dungeon_level(table: &[Transition], level: u32) -> u32 {
+    table
+        .iter()
+        .rev()
+        .find(|transition| level >= transition.level)
+        .map_or(0, |transition| transition.value)
+}
+
 #[derive(Serialize, Deserialize)]
 struct Game {
     map: Map,
@@ -455,22 +583,26 @@ enum Item {
     Lightning,
     Confusion,
     Fireball,
+    Sword,
+    Shield,
 }
 
 enum UseResult {
     UsedUp,
     Cancelled,
+    UsedAndKept,
 }
 
 fn cast_heal(_id: usize, _tcod: &mut Tcod, game: &mut Game, objects: &mut [Object]) -> UseResult {
-    if let Some(fighter) = objects[PLAYER].fighter {
-        if fighter.hp == fighter.max_hp {
+    let player = &mut objects[PLAYER];
+    if let Some(fighter) = player.fighter {
+        if fighter.hp == player.max_hp(game) {
             game.messages.add("You are already at full health", RED);
             return UseResult::Cancelled;
         }
         game.messages
             .add("Youre wounds start to feel better!", LIGHT_VIOLET);
-        objects[PLAYER].heal(HEAL_AMOUNT);
+        objects[PLAYER].heal(HEAL_AMOUNT, game);
         return UseResult::UsedUp;
     }
     UseResult::Cancelled
@@ -576,6 +708,42 @@ fn cast_fireball(
     UseResult::UsedUp
 }
 
+fn get_equipped_in_slot(slot: Slot, inventory: &[Object]) -> Option<usize> {
+    for (id, item) in inventory.iter().enumerate() {
+        if item
+            .equipment
+            .as_ref()
+            .map_or(false, |e| e.equipped && e.slot == slot)
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn toggle_equipment(
+    id: usize,
+    _tcod: &mut Tcod,
+    game: &mut Game,
+    _objects: &mut [Object],
+) -> UseResult {
+    let equipment = match game.inventory[id].equipment {
+        Some(equipment) => equipment,
+        None => return UseResult::Cancelled,
+    };
+
+    if equipment.equipped {
+        game.inventory[id].dequip(&mut game.messages);
+    } else {
+        if let Some(current) = get_equipped_in_slot(equipment.slot, &game.inventory) {
+            game.inventory[current].dequip(&mut game.messages);
+        }
+        game.inventory[id].equip(&mut game.messages);
+    }
+
+    UseResult::UsedAndKept
+}
+
 fn target_closest(tcod: &Tcod, objects: &[Object], max_range: i32) -> Option<usize> {
     let mut closest_enemy = None;
     let mut closest_distance = (max_range + 1) as f32;
@@ -661,12 +829,23 @@ fn pick_item_up(id: usize, game: &mut Game, objects: &mut Vec<Object>) {
         let item = objects.swap_remove(id);
         game.messages
             .add(format!("You've just picked up a {}!", item.name), GREEN);
+        let slot = item.equipment.map(|e| e.slot);
         game.inventory.push(item);
+
+        if let Some(slot) = slot {
+            if get_equipped_in_slot(slot, &game.inventory).is_none() {
+                let index = game.inventory.len() - 1;
+                game.inventory[index].equip(&mut game.messages);
+            }
+        }
     }
 }
 
 fn drop_item(id: usize, game: &mut Game, objects: &mut Vec<Object>) {
     let mut item = game.inventory.remove(id);
+    if item.equipment.is_some() {
+        item.dequip(&mut game.messages);
+    }
     item.set_pos(objects[PLAYER].x, objects[PLAYER].y);
     game.messages
         .add(format!("You dropped a {}.", item.name), YELLOW);
@@ -682,11 +861,14 @@ fn use_item(id: usize, tcod: &mut Tcod, game: &mut Game, objects: &mut [Object])
             Lightning => cast_lightning,
             Confusion => cast_confusion,
             Fireball => cast_fireball,
+            Sword => toggle_equipment,
+            Shield => toggle_equipment,
         };
         match on_use(id, tcod, game, objects) {
             UseResult::UsedUp => {
                 game.inventory.remove(id);
             }
+            UseResult::UsedAndKept => {}
             UseResult::Cancelled => {
                 game.messages.add("Cancelled", WHITE);
             }
@@ -719,25 +901,25 @@ fn level_up(tcod: &mut Tcod, game: &mut Game, objects: &mut [Object]) {
             choice = menu(
                 "Level up! Choose a stat to taise:\n",
                 &[
-                    format!("Constitution (+20 HP, from {})", fighter.max_hp),
-                    format!("Strength (+1 attack, from {})", fighter.power),
-                    format!("Agility (+1 defense, from {})", fighter.defense),
+                    format!("Constitution (+20 HP, from {})", fighter.base_max_hp),
+                    format!("Strength (+1 attack, from {})", fighter.base_power),
+                    format!("Agility (+1 defense, from {})", fighter.base_defense),
                 ],
                 LEVEL_SCREEN_WIDTH,
-                &mut tcod.root,
+                tcod,
             )
         }
         fighter.xp -= level_up_xp;
         match choice.unwrap() {
             0 => {
-                fighter.max_hp += 20;
+                fighter.base_max_hp += 20;
                 fighter.hp += 20;
             }
             1 => {
-                fighter.power += 1;
+                fighter.base_power += 1;
             }
             2 => {
-                fighter.defense += 1;
+                fighter.base_defense += 1;
             }
             _ => unreachable!(),
         }
@@ -768,7 +950,7 @@ fn carve_v_tunnel(y1: i32, y2: i32, x: i32, map: &mut Map) {
     }
 }
 
-fn make_map(objects: &mut Vec<Object>) -> Map {
+fn make_map(objects: &mut Vec<Object>, level: u32) -> Map {
     let mut map = vec![vec![Tile::wall(); MAP_HEIGHT as usize]; MAP_WIDTH as usize];
 
     let mut rooms: Vec<Rectangle> = vec![];
@@ -812,7 +994,7 @@ fn make_map(objects: &mut Vec<Object>) -> Map {
 
     for room in &rooms {
         carve_room(room, &mut map);
-        fill_with_objects(&room, &map, objects);
+        fill_with_objects(&room, &map, objects, level);
     }
 
     // stairs to go one level deeper
@@ -842,10 +1024,10 @@ fn create_orc(x: i32, y: i32) -> Object {
     let mut orc = Object::new(x, y, 'o', DESATURATED_GREEN, "orc", true);
     orc.alive = true;
     orc.fighter = Some(Fighter {
-        max_hp: 10,
-        hp: 10,
-        defense: 0,
-        power: 3,
+        base_max_hp: 20,
+        hp: 20,
+        base_defense: 0,
+        base_power: 4,
         xp: 35,
         on_death: DeathCallback::Monster,
     });
@@ -857,10 +1039,10 @@ fn create_troll(x: i32, y: i32) -> Object {
     let mut troll = Object::new(x, y, 'T', DARKER_GREEN, "troll", true);
     troll.alive = true;
     troll.fighter = Some(Fighter {
-        max_hp: 16,
-        hp: 16,
-        defense: 1,
-        power: 4,
+        base_max_hp: 30,
+        hp: 30,
+        base_defense: 2,
+        base_power: 8,
         xp: 100,
         on_death: DeathCallback::Monster,
     });
@@ -868,10 +1050,48 @@ fn create_troll(x: i32, y: i32) -> Object {
     troll
 }
 
-fn fill_with_objects(room: &Rectangle, map: &Map, objects: &mut Vec<Object>) {
-    let monster_count = rand::thread_rng().gen_range(0, MAX_ROOM_MONSTERS + 1);
+fn fill_with_objects(room: &Rectangle, map: &Map, objects: &mut Vec<Object>, level: u32) {
+    let max_monsters = from_dungeon_level(
+        &[
+            Transition { level: 1, value: 2 },
+            Transition { level: 4, value: 3 },
+            Transition { level: 6, value: 5 },
+        ],
+        level,
+    );
 
-    for _ in 0..monster_count {
+    let troll_chance = from_dungeon_level(
+        &[
+            Transition {
+                level: 3,
+                value: 15,
+            },
+            Transition {
+                level: 5,
+                value: 30,
+            },
+            Transition {
+                level: 7,
+                value: 60,
+            },
+        ],
+        level,
+    );
+
+    let mut monster_chances = [
+        Weighted {
+            weight: 80,
+            item: "orc",
+        },
+        Weighted {
+            weight: troll_chance,
+            item: "troll",
+        },
+    ];
+    let monster_choice = WeightedChoice::new(&mut monster_chances);
+
+    let num_monsters = rand::thread_rng().gen_range(0, max_monsters + 1);
+    for _ in 0..num_monsters {
         let x = rand::thread_rng().gen_range(room.x1 + 1, room.x2);
         let y = rand::thread_rng().gen_range(room.y1 + 1, room.y2);
 
@@ -879,53 +1099,139 @@ fn fill_with_objects(room: &Rectangle, map: &Map, objects: &mut Vec<Object>) {
             continue;
         }
 
-        let monster = if rand::random::<f32>() < 0.8 {
-            // 80% chance of getting an orc
-            create_orc(x, y)
-        } else {
-            create_troll(x, y)
+        let monster = match monster_choice.ind_sample(&mut rand::thread_rng()) {
+            "orc" => create_orc(x, y),
+            "troll" => create_troll(x, y),
+            _ => unreachable!(),
         };
 
         objects.push(monster);
     }
 
-    let num_items = rand::thread_rng().gen_range(0, MAX_ROOM_ITEMS + 1);
+    let max_items = from_dungeon_level(
+        &[
+            Transition { level: 1, value: 1 },
+            Transition { level: 4, value: 2 },
+        ],
+        level,
+    );
 
+    let mut item_chances = [
+        Weighted {
+            weight: 35,
+            item: Item::Heal,
+        },
+        Weighted {
+            weight: from_dungeon_level(&[Transition { level: 4, value: 5 }], level),
+            item: Item::Sword,
+        },
+        Weighted {
+            weight: from_dungeon_level(
+                &[Transition {
+                    level: 8,
+                    value: 15,
+                }],
+                level,
+            ),
+            item: Item::Shield,
+        },
+        Weighted {
+            weight: from_dungeon_level(
+                &[Transition {
+                    level: 4,
+                    value: 25,
+                }],
+                level,
+            ),
+            item: Item::Lightning,
+        },
+        Weighted {
+            weight: from_dungeon_level(
+                &[Transition {
+                    level: 6,
+                    value: 25,
+                }],
+                level,
+            ),
+            item: Item::Fireball,
+        },
+        Weighted {
+            weight: from_dungeon_level(
+                &[Transition {
+                    level: 2,
+                    value: 10,
+                }],
+                level,
+            ),
+            item: Item::Confusion,
+        },
+    ];
+    let item_choice = WeightedChoice::new(&mut item_chances);
+
+    let num_items = rand::thread_rng().gen_range(0, max_items + 1);
     for _ in 0..num_items {
         let x = rand::thread_rng().gen_range(room.x1 + 1, room.x2);
         let y = rand::thread_rng().gen_range(room.y1 + 1, room.y2);
 
-        if !is_blocked(x, y, map, objects) {
-            let dice = rand::random::<f32>();
-            let mut item = if dice < 0.7 {
-                // create a healing potion (70% chance)
+        if is_blocked(x, y, map, objects) {
+            continue;
+        }
+
+        let mut item = match item_choice.ind_sample(&mut rand::thread_rng()) {
+            Item::Heal => {
                 let mut object = Object::new(x, y, '!', VIOLET, "healing potion", false);
                 object.item = Some(Item::Heal);
                 object
-            } else if dice < 0.7 + 0.1 {
-                // create a lightning bolt scroll (10% chance)
+            }
+            Item::Shield => {
+                let mut object = Object::new(x, y, 'o', DARKER_ORANGE, "shield", false);
+                object.item = Some(Item::Shield);
+                object.equipment = Some(Equipment {
+                    equipped: false,
+                    slot: Slot::LeftHand,
+                    max_hp_bonus: 0,
+                    defense_bonus: 1,
+                    power_bonus: 0,
+                });
+                object
+            }
+            Item::Sword => {
+                let mut object = Object::new(x, y, '/', SKY, "sword", false);
+                object.item = Some(Item::Sword);
+                object.equipment = Some(Equipment {
+                    equipped: false,
+                    slot: Slot::RightHand,
+                    max_hp_bonus: 0,
+                    defense_bonus: 0,
+                    power_bonus: 3,
+                });
+                object
+            }
+            Item::Lightning => {
                 let mut object =
                     Object::new(x, y, '#', LIGHT_YELLOW, "scroll of lightning bolt", false);
                 object.item = Some(Item::Lightning);
                 object
-            } else if dice < 0.7 + 0.1 + 0.1 {
+            }
+            Item::Fireball => {
                 // create a fireball scroll (10% chance)
                 let mut object = Object::new(x, y, '#', LIGHT_YELLOW, "scroll of fireball", false);
                 object.item = Some(Item::Fireball);
                 object
-            } else {
+            }
+            Item::Confusion => {
                 // create a confusion scroll (10% chance)
                 let mut object = Object::new(x, y, '#', LIGHT_YELLOW, "scroll of confusion", false);
                 object.item = Some(Item::Confusion);
                 object
-            };
-            item.always_visible = true;
-            objects.push(item);
-        }
+            }
+        };
+        item.always_visible = true;
+        objects.push(item);
     }
 }
 
-fn menu<T: AsRef<str>>(header: &str, options: &[T], width: i32, root: &mut Root) -> Option<usize> {
+fn menu<T: AsRef<str>>(header: &str, options: &[T], width: i32, tcod: &mut Tcod) -> Option<usize> {
     assert!(
         options.len() <= 26,
         "Can't have a menu with more than 26 options."
@@ -933,7 +1239,8 @@ fn menu<T: AsRef<str>>(header: &str, options: &[T], width: i32, root: &mut Root)
     let header_height = if header.is_empty() {
         0
     } else {
-        root.get_height_rect(0, 0, width, SCREEN_HEIGHT, header)
+        tcod.root
+            .get_height_rect(0, 0, width, SCREEN_HEIGHT, header)
     };
     let height = options.len() as i32 + header_height;
 
@@ -963,10 +1270,20 @@ fn menu<T: AsRef<str>>(header: &str, options: &[T], width: i32, root: &mut Root)
 
     let x = (SCREEN_WIDTH - width) / 2;
     let y = (SCREEN_HEIGHT - height) / 2;
-    blit(&window, (0, 0), (width, height), root, (x, y), 1.0, 0.7);
+    blit(
+        &window,
+        (0, 0),
+        (width, height),
+        &mut tcod.root,
+        (x, y),
+        1.0,
+        0.7,
+    );
 
-    root.flush();
-    let key = root.wait_for_keypress(true);
+    tcod.root.flush();
+    let key = tcod.root.wait_for_keypress(true);
+
+    tcod.ignore_next_event = true;
 
     if key.printable.is_alphabetic() {
         let index = key.printable.to_ascii_lowercase() as usize - 'a' as usize;
@@ -980,19 +1297,27 @@ fn menu<T: AsRef<str>>(header: &str, options: &[T], width: i32, root: &mut Root)
     }
 }
 
-fn msgbox(text: &str, width: i32, root: &mut Root) {
+fn msgbox(text: &str, width: i32, tcod: &mut Tcod) {
     let options: Vec<&str> = vec![];
-    menu(text, &options, width, root);
+    menu(text, &options, width, tcod);
 }
 
-fn inventory_menu(inventory: &[Object], header: &str, root: &mut Root) -> Option<usize> {
+fn inventory_menu(inventory: &[Object], header: &str, tcod: &mut Tcod) -> Option<usize> {
     let options = if inventory.len() == 0 {
         vec!["Inventory is empty.".into()]
     } else {
-        inventory.iter().map(|i| i.name.clone()).collect()
+        inventory
+            .iter()
+            .map(|item| match item.equipment {
+                Some(equipment) if equipment.equipped => {
+                    format!("{} (on {})", item.name, equipment.slot)
+                }
+                _ => item.name.clone(),
+            })
+            .collect()
     };
 
-    let index = menu(header, &options, INVENTORY_WIDTH, root);
+    let index = menu(header, &options, INVENTORY_WIDTH, tcod);
 
     if inventory.len() > 0 {
         index
@@ -1094,11 +1419,8 @@ fn render_all(tcod: &mut Tcod, game: &Game, objects: &[Object]) {
     tcod.panel.set_default_background(BLACK);
     tcod.panel.clear();
 
-    let (hp, max_hp) = if let Some(fighter) = objects[PLAYER].fighter {
-        (fighter.hp, fighter.max_hp)
-    } else {
-        (0, 0)
-    };
+    let hp = objects[PLAYER].fighter.map_or(0, |f| f.hp);
+    let max_hp = objects[PLAYER].max_hp(game);
 
     render_bar(
         &mut tcod.panel,
@@ -1170,6 +1492,7 @@ struct Tcod {
     fov: FovMap,
     key: Key,
     mouse: Mouse,
+    ignore_next_event: bool,
 }
 
 fn handle_keys(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) -> PlayerAction {
@@ -1210,7 +1533,7 @@ fn handle_keys(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) -> P
             if let Some(choice) = inventory_menu(
                 &game.inventory,
                 "Press the key next to an item to drop it, or any other to cancel\n",
-                &mut tcod.root,
+                tcod,
             ) {
                 drop_item(choice, game, objects);
             }
@@ -1223,7 +1546,7 @@ fn handle_keys(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) -> P
             if let Some(choice) = inventory_menu(
                 &game.inventory,
                 "Press the key next to an item to use it, or any other to cancel\n",
-                &mut tcod.root,
+                tcod,
             ) {
                 use_item(choice, tcod, game, objects)
             }
@@ -1246,10 +1569,15 @@ Experience to level up: {}
 
 Maximum HP: {}
 Attack: {}
-Defence: {}",
-                    level, fighter.xp, level_up_xp, fighter.max_hp, fighter.power, fighter.defense
+Defense: {}",
+                    level,
+                    fighter.xp,
+                    level_up_xp,
+                    player.max_hp(game),
+                    player.power(game),
+                    player.defense(game),
                 );
-                msgbox(&msg, CHARACTER_SCREEN_WIDTH, &mut tcod.root);
+                msgbox(&msg, CHARACTER_SCREEN_WIDTH, tcod);
             }
 
             DidntTakeTurn
@@ -1340,10 +1668,10 @@ fn new_game(tcod: &mut Tcod) -> (Game, Vec<Object>) {
     let mut player = Object::new(0, 0, '@', WHITE, "player", true);
     player.alive = true;
     player.fighter = Some(Fighter {
-        max_hp: 30,
-        hp: 30,
-        defense: 2,
-        power: 5,
+        base_max_hp: 100,
+        hp: 100,
+        base_defense: 1,
+        base_power: 2,
         xp: 0,
         on_death: DeathCallback::Player,
     });
@@ -1352,11 +1680,22 @@ fn new_game(tcod: &mut Tcod) -> (Game, Vec<Object>) {
 
     // game map + message log
     let mut game = Game {
-        map: make_map(&mut objects),
+        map: make_map(&mut objects, 1),
         messages: Messages::new(),
         inventory: vec![],
         dungeon_level: 1,
     };
+
+    let mut dagger = Object::new(0, 0, '-', SKY, "dagger", false);
+    dagger.item = Some(Item::Sword);
+    dagger.equipment = Some(Equipment {
+        equipped: true,
+        slot: Slot::RightHand,
+        max_hp_bonus: 0,
+        defense_bonus: 0,
+        power_bonus: 2,
+    });
+    game.inventory.push(dagger);
 
     initialize_fov(tcod, &game.map);
 
@@ -1380,6 +1719,11 @@ fn play_game(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) {
             Some((_, Event::Mouse(m))) => tcod.mouse = m,
             Some((_, Event::Key(k))) => tcod.key = k,
             _ => tcod.key = Default::default(),
+        }
+
+        if tcod.ignore_next_event {
+            tcod.ignore_next_event = false;
+            continue;
         }
 
         tcod.con.clear();
@@ -1410,8 +1754,8 @@ fn next_level(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) {
         "You take a moment to rest, and recover your strength.",
         VIOLET,
     );
-    let heal_hp = objects[PLAYER].fighter.map_or(0, |f| f.max_hp / 2);
-    objects[PLAYER].heal(heal_hp);
+    let heal_hp = objects[PLAYER].max_hp(game) / 2;
+    objects[PLAYER].heal(heal_hp, game);
 
     game.messages.add(
         "After a rare moment of peace, you descend deeper into \
@@ -1419,7 +1763,7 @@ fn next_level(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) {
         RED,
     );
     game.dungeon_level += 1;
-    game.map = make_map(objects);
+    game.map = make_map(objects, game.dungeon_level);
     initialize_fov(tcod, &game.map);
 }
 
@@ -1449,7 +1793,7 @@ fn main_menu(tcod: &mut Tcod) {
         );
 
         let choices = &["Play a new game", "Continue last game", "Quit"];
-        let choice = menu("", choices, 24, &mut tcod.root);
+        let choice = menu("", choices, 24, tcod);
 
         match choice {
             Some(0) => {
@@ -1465,7 +1809,7 @@ fn main_menu(tcod: &mut Tcod) {
                         play_game(tcod, &mut game, &mut objects);
                     }
                     Err(_) => {
-                        msgbox("\nNo saved game to load.\n", 24, &mut tcod.root);
+                        msgbox("\nNo saved game to load.\n", 24, tcod);
                         continue;
                     }
                 }
@@ -1496,9 +1840,8 @@ fn main() {
         fov: FovMap::new(MAP_WIDTH, MAP_HEIGHT),
         key: Default::default(),
         mouse: Default::default(),
+        ignore_next_event: false,
     };
 
-    // let (mut game, mut objects) = new_game(&mut tcod);
-    // play_game(&mut tcod, &mut game, &mut objects);
     main_menu(&mut tcod);
 }
